@@ -631,11 +631,31 @@ async def on_message(message):
     print(f'  [MSG] {message.author}: {content[:80]}')
 
     # ── !pdf → demucs + Piano Transcription + LilyPond ──
+    # ── !help → 功能說明 ──
+    if content.lower() in ('!help', '!指令', '!commands'):
+        help_text = """**🎵 Music Grab Bot 指令說明**
+
+📥 **下載**
+`YouTube URL` → 直接下載 MP3
+`!video <URL>` → 下載影片 MP4
+
+🎼 **音樂處理**
+`!dep <URL>` → Demucs 分離四軌（人聲/鼓/貝斯/其他）
+`!midi <URL>` → 轉 MIDI（人聲+伴奏）
+`!pdf <URL>` → 轉樂譜 PDF
+
+🔊 **文件轉語音**
+上傳 PDF 或 DOCX → AI 摘要 → MP3 語音
+
+💡 所有 YouTube 指令支援 youtube.com 和 youtu.be 連結"""
+        await message.channel.send(help_text)
+        return
+
     # ── 指令判斷 ──
     is_video_cmd = content.lower().startswith('!video')
+    is_dep_cmd = content.lower().startswith('!dep')
     is_pdf_cmd = content.lower().startswith('!pdf')
     is_midi_cmd = content.lower().startswith('!midi')
-    is_mp3_cmd = content.lower().startswith('!mp3')
     yt_match = YT_URL_PATTERN.search(content)
 
     if is_video_cmd and yt_match:
@@ -714,8 +734,37 @@ async def on_message(message):
             shutil.rmtree(tmpdir, ignore_errors=True)
         return
 
-    # ── !mp3 → 直接下載 MP3 ──
-    if is_mp3_cmd and yt_match:
+    # ── !dep → demucs 分離四軌 ──
+    if is_dep_cmd and yt_match:
+        url = yt_match.group(0)
+        if not url.startswith('http'):
+            url = 'https://' + url
+
+        await message.channel.send('收到 YouTube 連結，開始分離音軌（需要幾分鐘）...')
+        tmpdir = tempfile.mkdtemp()
+        try:
+            stems, title = await loop.run_in_executor(
+                None, sheet_pipeline, url, tmpdir)
+            safe_name = re.sub(r'[^\w\s\-]', '', title)[:40] or 'audio'
+
+            stem_labels = {
+                'vocals': '🎤 人聲', 'drums': '🥁 鼓',
+                'bass': '🎸 貝斯', 'other': '🎹 其他樂器'
+            }
+            for stem_name, stem_path in stems.items():
+                label = stem_labels.get(stem_name, stem_name)
+                await message.channel.send(
+                    content=f'**{title}** — {label}：',
+                    file=discord.File(stem_path, filename=f'{safe_name}_{stem_name}.mp3'))
+            await message.channel.send('分離完成！')
+        except Exception as e:
+            await message.channel.send(f'分離失敗：{e}')
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+
+    # ── 直接貼 URL → 下載 MP3 ──
+    if yt_match:
         url = yt_match.group(0)
         if not url.startswith('http'):
             url = 'https://' + url
@@ -729,59 +778,20 @@ async def on_message(message):
             filename = f'{safe_name}.mp3'
 
             fsize = os.path.getsize(mp3_path)
-            print(f'  MP3: {fsize/1024/1024:.1f} MB, file={mp3_path}')
+            print(f'  MP3: {fsize/1024/1024:.1f} MB')
             if fsize <= DISCORD_MAX_BYTES:
                 await message.channel.send(
                     content=f'**{title}**',
                     file=discord.File(mp3_path, filename=filename))
             else:
                 await message.channel.send(f'檔案 {fsize/1024/1024:.1f} MB，上傳到 GitHub...')
-                # 用簡單的時間戳檔名避免編碼問題
                 import time
                 ts_name = f'mp3_{int(time.time())}.mp3'
-                print(f'  Uploading as {ts_name}...')
                 dl_url = await loop.run_in_executor(
                     None, upload_to_github, mp3_path, ts_name)
-                print(f'  URL: {dl_url}')
                 await message.channel.send(f'**{title}**\n{dl_url}')
         except Exception as e:
             await message.channel.send(f'下載失敗：{e}')
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        return
-
-    # ── YouTube → 分離音軌 ──
-    if yt_match:
-        url = yt_match.group(0)
-        if not url.startswith('http'):
-            url = 'https://' + url
-
-        await message.channel.send(f'收到 YouTube 連結，開始分離音軌...')
-
-        tmpdir = tempfile.mkdtemp()
-        try:
-            await message.channel.send('下載音頻中...')
-
-            stems, title = await loop.run_in_executor(
-                None, sheet_pipeline, url, tmpdir)
-
-            safe_name = re.sub(r'[^\w\s\-]', '', title)[:40] or 'score'
-
-            # 傳送分離音軌
-            stem_labels = {
-                'vocals': '🎤 人聲', 'drums': '🥁 鼓',
-                'bass': '🎸 貝斯', 'other': '🎹 其他樂器'
-            }
-            for stem_name, stem_path in stems.items():
-                label = stem_labels.get(stem_name, stem_name)
-                await message.channel.send(
-                    content=f'**{title}** — {label}：',
-                    file=discord.File(stem_path, filename=f'{safe_name}_{stem_name}.mp3'))
-
-            await message.channel.send('轉換完成！')
-
-        except Exception as e:
-            await message.channel.send(f'轉換失敗：{e}')
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
         return
