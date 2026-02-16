@@ -19,6 +19,7 @@ from newslib import read_docx, read_pdf, chunk_text
 import pretty_midi
 import numpy as np
 import librosa
+from piano_transcription_inference import PianoTranscription, sample_rate as PT_SR, load_audio
 
 DISCORD_TOKEN = os.environ.get('DISCORD_BOT_TOKEN', '')
 SUPPORTED_EXT = ('.pdf', '.docx')
@@ -145,6 +146,90 @@ def upload_to_github(filepath, filename):
     from urllib.parse import quote
     safe_fn = quote(filename)
     return f'https://github.com/{GH_REPO}/releases/download/{GH_RELEASE_TAG}/{safe_fn}'
+
+
+def transcribe_to_midi(audio_path, output_midi):
+    """用 ByteDance Piano Transcription 轉 MIDI"""
+    print('  Loading audio for transcription...')
+    audio, _ = load_audio(audio_path, sr=PT_SR, mono=True)
+    print(f'  Audio: {len(audio)/PT_SR:.1f}s')
+    print('  Running Piano Transcription model...')
+    transcriptor = PianoTranscription(device='cpu')
+    transcriptor.transcribe(audio, output_midi)
+    print(f'  MIDI saved: {output_midi}')
+    return output_midi
+
+
+def midi_pipeline(url, tmpdir):
+    """YouTube → demucs → Piano Transcription → MIDI (vocals + other)"""
+    title = yt_get_title(url)
+    print(f'  Title: {title}')
+
+    # 1. Download
+    wav = yt_download_audio(url, tmpdir)
+
+    # 2. Demucs separate
+    stems = separate_stems(wav, tmpdir)
+
+    other_path = stems.get('other')
+    vocals_path = stems.get('vocals')
+    if not other_path:
+        raise RuntimeError('demucs 未產出 other 軌')
+
+    # 3. Transcribe other (instruments)
+    print('  Transcribing instruments...')
+    other_midi = os.path.join(tmpdir, 'other.mid')
+    transcribe_to_midi(other_path, other_midi)
+
+    # 4. Transcribe vocals
+    vocals_midi = None
+    if vocals_path:
+        print('  Transcribing vocals...')
+        vocals_midi = os.path.join(tmpdir, 'vocals.mid')
+        transcribe_to_midi(vocals_path, vocals_midi)
+
+    return other_midi, vocals_midi, title
+
+
+def merge_midi(other_midi, vocals_midi, output_path):
+    """合併人聲和伴奏 MIDI，人聲用獨立 track"""
+    other = pretty_midi.PrettyMIDI(other_midi)
+
+    # 重新命名 other 的 instrument
+    for inst in other.instruments:
+        if not inst.is_drum:
+            inst.name = 'Piano'
+
+    if vocals_midi:
+        vocals = pretty_midi.PrettyMIDI(vocals_midi)
+        for inst in vocals.instruments:
+            if not inst.is_drum:
+                inst.name = 'Vocals'
+                inst.program = 73  # Flute (近似人聲的音色)
+                other.instruments.append(inst)
+
+    other.write(output_path)
+    return output_path
+
+
+def pdf_pipeline(url, tmpdir):
+    """YouTube → demucs → Piano Transcription → MIDI → LilyPond → PDF"""
+    other_midi, vocals_midi, title = midi_pipeline(url, tmpdir)
+
+    # 合併 MIDI
+    merged_midi = os.path.join(tmpdir, 'merged.mid')
+    merge_midi(other_midi, vocals_midi, merged_midi)
+
+    # MIDI → LilyPond（含人聲譜）
+    ly_path = os.path.join(tmpdir, 'score.ly')
+    print('  Converting MIDI to LilyPond...')
+    midi_to_lilypond_full(other_midi, vocals_midi, ly_path, title=title)
+    print('  LilyPond file created, compiling PDF...')
+
+    # LilyPond → PDF
+    pdf_path = lilypond_to_pdf(ly_path, tmpdir)
+    print(f'  PDF done: {pdf_path}')
+    return pdf_path, merged_midi, title
 
 
 def yt_download_audio(url, tmpdir):
@@ -399,10 +484,99 @@ def midi_to_lilypond(midi_path, ly_path, title='Piano', key_info=None):
         f.write(ly)
 
 
+def midi_to_lilypond_full(other_midi, vocals_midi, ly_path, title='Score'):
+    """MIDI → LilyPond 總譜（人聲 + 鋼琴左右手）"""
+
+    def get_notes(midi_path):
+        midi = pretty_midi.PrettyMIDI(midi_path)
+        notes = []
+        for inst in midi.instruments:
+            if not inst.is_drum:
+                notes.extend(inst.notes)
+        notes.sort(key=lambda n: n.start)
+        return notes, midi
+
+    other_notes, other_pm = get_notes(other_midi)
+
+    # BPM
+    tempo_times, tempos = other_pm.get_tempo_changes()
+    bpm = int(tempos[0]) if len(tempos) > 0 else 120
+
+    SHARP_NAMES = ['c', 'cis', 'd', 'dis', 'e', 'f', 'fis', 'g', 'gis', 'a', 'ais', 'b']
+
+    def pitch_to_lily(p):
+        octave = (p // 12) - 1
+        name = SHARP_NAMES[p % 12]
+        diff = octave - 3
+        if diff > 0:
+            name += "'" * diff
+        elif diff < 0:
+            name += "," * abs(diff)
+        return name
+
+    def dur_to_lily(dur_sec):
+        beat = 60.0 / bpm
+        beats = dur_sec / beat
+        if beats >= 3.5: return '1'
+        elif beats >= 1.75: return '2'
+        elif beats >= 0.875: return '4'
+        elif beats >= 0.4375: return '8'
+        elif beats >= 0.21875: return '16'
+        else: return '32'
+
+    def to_str(nl):
+        if not nl:
+            return 'r1 r1 r1 r1'
+        return ' '.join(f'{pitch_to_lily(n.pitch)}{dur_to_lily(n.end - n.start)}' for n in nl)
+
+    # Piano: split by middle C
+    right = [n for n in other_notes if n.pitch >= 60]
+    left = [n for n in other_notes if n.pitch < 60]
+
+    # Vocals
+    vocal_str = 'r1 r1 r1 r1'
+    if vocals_midi:
+        vocal_notes, _ = get_notes(vocals_midi)
+        if vocal_notes:
+            vocal_str = to_str(vocal_notes)
+
+    safe_title = re.sub(r'[\\\"{}]', '', title)
+    ly = f'''\\version "2.24.0"
+\\header {{
+  title = "{safe_title}"
+  subtitle = "AI-transcribed from YouTube"
+  tagline = "Generated by Music Grab Bot"
+}}
+\\score {{
+  <<
+    \\new Staff = "vocals" \\with {{ instrumentName = "Vocals" }} {{
+      \\clef treble
+      \\tempo 4 = {bpm}
+      {{ {vocal_str} }}
+    }}
+    \\new PianoStaff \\with {{ instrumentName = "Piano" }} <<
+      \\new Staff = "right" {{
+        \\clef treble
+        {{ {to_str(right)} }}
+      }}
+      \\new Staff = "left" {{
+        \\clef bass
+        {{ {to_str(left)} }}
+      }}
+    >>
+  >>
+  \\layout {{ }}
+}}
+'''
+    with open(ly_path, 'w') as f:
+        f.write(ly)
+    print(f'  LilyPond: vocals={len(vocal_str.split())}, right={len(right)}, left={len(left)} notes')
+
+
 def lilypond_to_pdf(ly_path, tmpdir):
     r = subprocess.run(
         ['lilypond', '-dno-point-and-click', '-o', os.path.join(tmpdir, 'score'), ly_path],
-        capture_output=True, text=True, timeout=180)
+        capture_output=True, text=True, timeout=600)
     pdf_path = os.path.join(tmpdir, 'score.pdf')
     if not os.path.exists(pdf_path):
         raise RuntimeError(f'LilyPond 編譯失敗: {r.stderr[-500:]}')
@@ -440,9 +614,58 @@ async def on_message(message):
     loop = asyncio.get_event_loop()
     print(f'  [MSG] {message.author}: {content[:80]}')
 
+    # ── !pdf → demucs + Piano Transcription + LilyPond ──
+    is_pdf_cmd = content.lower().startswith('!pdf')
+    is_midi_cmd = content.lower().startswith('!midi')
+    yt_match = YT_URL_PATTERN.search(content)
+
+    if is_pdf_cmd and yt_match:
+        url = yt_match.group(0)
+        if not url.startswith('http'):
+            url = 'https://' + url
+
+        await message.channel.send('開始轉樂譜（下載 → 分離音軌 → 轉譜 → PDF），需要幾分鐘...')
+        tmpdir = tempfile.mkdtemp()
+        try:
+            pdf_path, midi_path, title = await loop.run_in_executor(
+                None, pdf_pipeline, url, tmpdir)
+            safe_name = re.sub(r'[^\w\s\-]', '', title)[:40] or 'score'
+            await message.channel.send(
+                content=f'**{title}** 樂譜：',
+                file=discord.File(pdf_path, filename=f'{safe_name}.pdf'))
+            await message.channel.send(
+                content=f'MIDI：',
+                file=discord.File(midi_path, filename=f'{safe_name}.mid'))
+        except Exception as e:
+            await message.channel.send(f'轉譜失敗：{e}')
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+
+    if is_midi_cmd and yt_match:
+        url = yt_match.group(0)
+        if not url.startswith('http'):
+            url = 'https://' + url
+
+        await message.channel.send('開始轉 MIDI（下載 → 分離音軌 → 轉譜），需要幾分鐘...')
+        tmpdir = tempfile.mkdtemp()
+        try:
+            other_midi, vocals_midi, title = await loop.run_in_executor(
+                None, midi_pipeline, url, tmpdir)
+            merged = os.path.join(tmpdir, 'merged.mid')
+            merge_midi(other_midi, vocals_midi, merged)
+            safe_name = re.sub(r'[^\w\s\-]', '', title)[:40] or 'midi'
+            await message.channel.send(
+                content=f'**{title}** MIDI（人聲+伴奏）：',
+                file=discord.File(merged, filename=f'{safe_name}.mid'))
+        except Exception as e:
+            await message.channel.send(f'轉譜失敗：{e}')
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+
     # ── !mp3 → 直接下載 MP3 ──
     is_mp3_cmd = content.lower().startswith('!mp3')
-    yt_match = YT_URL_PATTERN.search(content)
 
     if is_mp3_cmd and yt_match:
         url = yt_match.group(0)
