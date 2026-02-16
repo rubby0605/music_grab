@@ -22,7 +22,7 @@ import librosa
 
 DISCORD_TOKEN = os.environ.get('DISCORD_BOT_TOKEN', '')
 SUPPORTED_EXT = ('.pdf', '.docx')
-DISCORD_MAX_BYTES = 25 * 1024 * 1024
+DISCORD_MAX_BYTES = 8 * 1024 * 1024  # 未加成伺服器上限 8MB
 YT_URL_PATTERN = re.compile(
     r'(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w\-]+'
 )
@@ -90,6 +90,61 @@ def yt_get_title(url):
         return r.stdout.strip()[:60] or 'Untitled'
     except Exception:
         return 'Untitled'
+
+
+def yt_download_mp3(url, tmpdir):
+    """YouTube → MP3（不分離音軌，128kbps）"""
+    output_path = os.path.join(tmpdir, 'raw.%(ext)s')
+    r = subprocess.run(
+        ['yt-dlp', '-x', '--audio-format', 'wav',
+         '-o', output_path, '--no-playlist', url],
+        capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        raise RuntimeError(f'yt-dlp 失敗: {r.stderr[-300:]}')
+    raw_path = None
+    for f in os.listdir(tmpdir):
+        if f.startswith('raw.'):
+            raw_path = os.path.join(tmpdir, f)
+            break
+    if not raw_path:
+        raise RuntimeError('下載失敗：找不到音頻檔')
+
+    mp3_path = os.path.join(tmpdir, 'audio.mp3')
+    subprocess.run(
+        ['ffmpeg', '-y', '-i', raw_path, '-b:a', '128k', mp3_path],
+        capture_output=True, timeout=120)
+    if not os.path.exists(mp3_path):
+        raise RuntimeError('ffmpeg 轉檔失敗')
+    return mp3_path
+
+
+GH_REPO = 'rubby0605/music_grab'
+GH_RELEASE_TAG = 'mp3-files'
+
+
+def upload_to_github(filepath, filename):
+    """上傳檔案到 GitHub Release，回傳下載連結"""
+    gh_token = os.environ.get('GH_TOKEN', '')
+    if not gh_token:
+        raise RuntimeError('未設定 GH_TOKEN')
+
+    # 複製檔案並重新命名
+    upload_path = os.path.join(os.path.dirname(filepath), filename)
+    if upload_path != filepath:
+        shutil.copy2(filepath, upload_path)
+
+    # 上傳（--clobber 覆蓋同名檔案）
+    r = subprocess.run(
+        ['gh', 'release', 'upload', GH_RELEASE_TAG, upload_path,
+         '--repo', GH_REPO, '--clobber'],
+        capture_output=True, text=True, timeout=300,
+        env={**os.environ, 'GH_TOKEN': gh_token})
+    if r.returncode != 0:
+        raise RuntimeError(f'GitHub 上傳失敗: {r.stderr[-200:]}')
+
+    from urllib.parse import quote
+    safe_fn = quote(filename)
+    return f'https://github.com/{GH_REPO}/releases/download/{GH_RELEASE_TAG}/{safe_fn}'
 
 
 def yt_download_audio(url, tmpdir):
@@ -365,16 +420,7 @@ def sheet_pipeline(url, tmpdir):
     # 2. demucs 分離 4 軌
     stems = separate_stems(wav, tmpdir)
 
-    # 3. 用 other 軌（純樂器）→ librosa 轉 MIDI
-    source = stems.get('other', wav)
-    midi_path, meta = audio_to_midi(source, tmpdir)
-
-    # 4. MIDI → LilyPond → PDF
-    ly_path = os.path.join(tmpdir, 'score.ly')
-    midi_to_lilypond(midi_path, ly_path, title=title, key_info=meta)
-    pdf = lilypond_to_pdf(ly_path, tmpdir)
-
-    return pdf, midi_path, stems, title
+    return stems, title
 
 
 # ── Discord Events ────────────────────────
@@ -392,21 +438,60 @@ async def on_message(message):
 
     content = message.content.strip()
     loop = asyncio.get_event_loop()
+    print(f'  [MSG] {message.author}: {content[:80]}')
 
-    # ── YouTube → 樂譜 ──
+    # ── !mp3 → 直接下載 MP3 ──
+    is_mp3_cmd = content.lower().startswith('!mp3')
     yt_match = YT_URL_PATTERN.search(content)
+
+    if is_mp3_cmd and yt_match:
+        url = yt_match.group(0)
+        if not url.startswith('http'):
+            url = 'https://' + url
+
+        await message.channel.send('下載 MP3 中...')
+        tmpdir = tempfile.mkdtemp()
+        try:
+            title = await loop.run_in_executor(None, yt_get_title, url)
+            mp3_path = await loop.run_in_executor(None, yt_download_mp3, url, tmpdir)
+            safe_name = re.sub(r'[^\w\s\-]', '', title)[:40] or 'audio'
+            filename = f'{safe_name}.mp3'
+
+            fsize = os.path.getsize(mp3_path)
+            print(f'  MP3: {fsize/1024/1024:.1f} MB, file={mp3_path}')
+            if fsize <= DISCORD_MAX_BYTES:
+                await message.channel.send(
+                    content=f'**{title}**',
+                    file=discord.File(mp3_path, filename=filename))
+            else:
+                await message.channel.send(f'檔案 {fsize/1024/1024:.1f} MB，上傳到 GitHub...')
+                # 用簡單的時間戳檔名避免編碼問題
+                import time
+                ts_name = f'mp3_{int(time.time())}.mp3'
+                print(f'  Uploading as {ts_name}...')
+                dl_url = await loop.run_in_executor(
+                    None, upload_to_github, mp3_path, ts_name)
+                print(f'  URL: {dl_url}')
+                await message.channel.send(f'**{title}**\n{dl_url}')
+        except Exception as e:
+            await message.channel.send(f'下載失敗：{e}')
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+
+    # ── YouTube → 分離音軌 ──
     if yt_match:
         url = yt_match.group(0)
         if not url.startswith('http'):
             url = 'https://' + url
 
-        await message.channel.send(f'收到 YouTube 連結，開始轉換鋼琴樂譜...')
+        await message.channel.send(f'收到 YouTube 連結，開始分離音軌...')
 
         tmpdir = tempfile.mkdtemp()
         try:
-            await message.channel.send('1/4 下載音頻...')
+            await message.channel.send('下載音頻中...')
 
-            pdf_path, midi_path, stems, title = await loop.run_in_executor(
+            stems, title = await loop.run_in_executor(
                 None, sheet_pipeline, url, tmpdir)
 
             safe_name = re.sub(r'[^\w\s\-]', '', title)[:40] or 'score'
@@ -419,17 +504,8 @@ async def on_message(message):
             for stem_name, stem_path in stems.items():
                 label = stem_labels.get(stem_name, stem_name)
                 await message.channel.send(
-                    content=f'{label}：',
+                    content=f'**{title}** — {label}：',
                     file=discord.File(stem_path, filename=f'{safe_name}_{stem_name}.mp3'))
-
-            # 傳送樂譜和 MIDI
-            await message.channel.send(
-                content=f'**{title}** 鋼琴樂譜：',
-                file=discord.File(pdf_path, filename=f'{safe_name}.pdf'))
-
-            await message.channel.send(
-                content='MIDI 檔（可匯入 MuseScore 編輯）：',
-                file=discord.File(midi_path, filename=f'{safe_name}.mid'))
 
             await message.channel.send('轉換完成！')
 
