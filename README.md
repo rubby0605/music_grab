@@ -1,25 +1,29 @@
 # Music Grab
 
-Discord bot with two main features:
+Discord bot for YouTube audio download, stem separation, and document-to-speech.
 
-## Features
+## Commands
 
-### 1. YouTube Audio Stem Separation
-Paste a YouTube URL in Discord, and the bot will:
-- Download the audio via `yt-dlp`
-- Separate it into 4 stems using [Demucs](https://github.com/facebookresearch/demucs) (htdemucs model):
-  - Vocals
-  - Drums
-  - Bass
-  - Other instruments
-- Send back 4 MP3 files
+### `!mp3 <YouTube URL>`
+Download YouTube audio as MP3 (128kbps).
+- Small files sent directly in Discord
+- Large files (>8MB) uploaded to [GitHub Releases](https://github.com/rubby0605/music_grab/releases/tag/mp3-files) with download link
 
-### 2. Document to Speech (PDF/DOCX)
-Upload a `.pdf` or `.docx` file, and the bot will:
-- Extract text (`python-docx` / `pdfplumber`)
-- Summarize with GPT-4o-mini
-- Convert to speech with OpenAI TTS
-- Send back an MP3
+### YouTube URL (no prefix)
+Paste a YouTube URL to separate audio into 4 stems using [Demucs](https://github.com/facebookresearch/demucs):
+- Vocals
+- Drums
+- Bass
+- Other instruments
+
+Each stem is sent as an MP3 file.
+
+### Upload PDF / DOCX
+Upload a `.pdf` or `.docx` file to get an AI-narrated audio summary:
+1. Text extraction via `python-docx` / `pdfplumber`
+2. Summarization via GPT-4o-mini
+3. Text-to-speech via OpenAI TTS
+4. MP3 sent back in Discord
 
 ## Setup
 
@@ -28,13 +32,11 @@ Upload a `.pdf` or `.docx` file, and the bot will:
 pip install discord.py openai python-docx pdfplumber yt-dlp demucs librosa pretty_midi numpy
 ```
 
-[LilyPond](https://lilypond.org/) is optional (not currently used in output).
-
 ### Environment Variables
-Set these in your shell profile (e.g. `~/.zshrc`):
 ```bash
-export DISCORD_BOT_TOKEN='your-discord-bot-token'
-export OPENAI_API_KEY='your-openai-api-key'
+export DISCORD_BOT_TOKEN='...'
+export OPENAI_API_KEY='...'
+export GH_TOKEN='...'   # GitHub PAT for release uploads
 ```
 
 ### Run
@@ -42,6 +44,6 @@ export OPENAI_API_KEY='your-openai-api-key'
 python discord_tts_bot.py
 ```
 
-## File Structure
-- `discord_tts_bot.py` — Main bot logic
+## Files
+- `discord_tts_bot.py` — Bot main logic
 - `newslib.py` — Text extraction and chunking helpers
