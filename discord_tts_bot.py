@@ -93,6 +93,22 @@ def yt_get_title(url):
         return 'Untitled'
 
 
+def yt_download_video(url, tmpdir):
+    """YouTube → MP4 影片"""
+    output_path = os.path.join(tmpdir, 'video.%(ext)s')
+    r = subprocess.run(
+        ['yt-dlp', '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+         '--merge-output-format', 'mp4',
+         '-o', output_path, '--no-playlist', url],
+        capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(f'yt-dlp 失敗: {r.stderr[-300:]}')
+    for f in os.listdir(tmpdir):
+        if f.startswith('video.'):
+            return os.path.join(tmpdir, f)
+    raise RuntimeError('下載失敗：找不到影片檔')
+
+
 def yt_download_mp3(url, tmpdir):
     """YouTube → MP3（不分離音軌，128kbps）"""
     output_path = os.path.join(tmpdir, 'raw.%(ext)s')
@@ -615,9 +631,43 @@ async def on_message(message):
     print(f'  [MSG] {message.author}: {content[:80]}')
 
     # ── !pdf → demucs + Piano Transcription + LilyPond ──
+    # ── 指令判斷 ──
+    is_video_cmd = content.lower().startswith('!video')
     is_pdf_cmd = content.lower().startswith('!pdf')
     is_midi_cmd = content.lower().startswith('!midi')
+    is_mp3_cmd = content.lower().startswith('!mp3')
     yt_match = YT_URL_PATTERN.search(content)
+
+    if is_video_cmd and yt_match:
+        url = yt_match.group(0)
+        if not url.startswith('http'):
+            url = 'https://' + url
+
+        await message.channel.send('下載影片中...')
+        tmpdir = tempfile.mkdtemp()
+        try:
+            title = await loop.run_in_executor(None, yt_get_title, url)
+            video_path = await loop.run_in_executor(None, yt_download_video, url, tmpdir)
+            safe_name = re.sub(r'[^\w\s\-]', '', title)[:40] or 'video'
+
+            fsize = os.path.getsize(video_path)
+            print(f'  Video: {fsize/1024/1024:.1f} MB')
+            if fsize <= DISCORD_MAX_BYTES:
+                await message.channel.send(
+                    content=f'**{title}**',
+                    file=discord.File(video_path, filename=f'{safe_name}.mp4'))
+            else:
+                await message.channel.send(f'影片 {fsize/1024/1024:.1f} MB，上傳到 GitHub...')
+                import time
+                ts_name = f'video_{int(time.time())}.mp4'
+                dl_url = await loop.run_in_executor(
+                    None, upload_to_github, video_path, ts_name)
+                await message.channel.send(f'**{title}**\n{dl_url}')
+        except Exception as e:
+            await message.channel.send(f'下載失敗：{e}')
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return
 
     if is_pdf_cmd and yt_match:
         url = yt_match.group(0)
@@ -665,8 +715,6 @@ async def on_message(message):
         return
 
     # ── !mp3 → 直接下載 MP3 ──
-    is_mp3_cmd = content.lower().startswith('!mp3')
-
     if is_mp3_cmd and yt_match:
         url = yt_match.group(0)
         if not url.startswith('http'):
