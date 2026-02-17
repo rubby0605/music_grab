@@ -652,15 +652,36 @@ def align_lyrics_to_notes(whisper_result, vocal_notes):
     if not segments:
         return []
 
-    # 把每個 segment 的文字拆成帶時間戳的字元
+    # 把每個 segment 拆成 token（CJK 逐字、英文保持整字）
+    def _tokenize(text):
+        tokens = []
+        word = ''
+        for ch in text:
+            if ('\u4e00' <= ch <= '\u9fff' or '\u3040' <= ch <= '\u30ff'
+                    or '\u31f0' <= ch <= '\u31ff' or '\uff00' <= ch <= '\uffef'
+                    or '\u3400' <= ch <= '\u4dbf' or '\uac00' <= ch <= '\ud7af'):
+                if word.strip():
+                    tokens.append(word.strip())
+                    word = ''
+                tokens.append(ch)
+            elif ch in (' ', '\n', '\t'):
+                if word.strip():
+                    tokens.append(word.strip())
+                    word = ''
+            else:
+                word += ch
+        if word.strip():
+            tokens.append(word.strip())
+        return tokens
+
     timed_chars = []
     for seg_start, seg_end, text in segments:
-        chars = [ch for ch in text if ch.strip()]
-        if not chars:
+        tokens = _tokenize(text)
+        if not tokens:
             continue
-        char_dur = (seg_end - seg_start) / max(len(chars), 1)
-        for i, ch in enumerate(chars):
-            timed_chars.append((seg_start + i * char_dur, ch))
+        tok_dur = (seg_end - seg_start) / max(len(tokens), 1)
+        for i, tok in enumerate(tokens):
+            timed_chars.append((seg_start + i * tok_dur, tok))
 
     if not timed_chars:
         return []
@@ -674,9 +695,9 @@ def align_lyrics_to_notes(whisper_result, vocal_notes):
             ci += 1
 
         if ci < len(timed_chars) and abs(timed_chars[ci][0] - note.start) < 1.5:
-            ch = timed_chars[ci][1]
-            safe_ch = ch.replace('"', '').replace('\\', '').replace('{', '').replace('}', '')
-            result.append(f'"{safe_ch}"' if safe_ch else '_')
+            tok = timed_chars[ci][1]
+            safe_tok = tok.replace('"', '').replace('\\', '').replace('{', '').replace('}', '')
+            result.append(f'"{safe_tok}"' if safe_tok else '_')
             ci += 1
         else:
             result.append('_')
