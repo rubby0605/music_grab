@@ -8,6 +8,7 @@ Discord Bot：
 
 import os
 import re
+import time
 import tempfile
 import asyncio
 import functools
@@ -299,6 +300,9 @@ def pdf_pipeline(url, tmpdir, progress_cb=None):
     other_path = stems.get('other')
     vocals_path = stems.get('vocals')
 
+    if not other_path:
+        raise RuntimeError('demucs 未產出 other 軌')
+
     update('🎹 轉譜：伴奏軌...')
     other_midi = os.path.join(tmpdir, 'other.mid')
     transcribe_to_midi(other_path, other_midi)
@@ -334,25 +338,25 @@ def pdf_pipeline(url, tmpdir, progress_cb=None):
     return pdf_path, merged_midi, title
 
 
-def whisper_transcribe(audio_path, tmpdir):
-    """用 OpenAI Whisper API 辨識歌詞，回傳 word-level 時間戳"""
+def whisper_transcribe(audio_path, tmpdir, language=None):
+    """用 OpenAI Whisper API 辨識語音，回傳時間戳。language=None 自動偵測"""
     openai_client = OpenAI()
-    # 壓縮成小 mp3 給 API
     compressed = os.path.join(tmpdir, 'whisper_input.mp3')
     subprocess.run(
         ['ffmpeg', '-y', '-i', audio_path, '-ac', '1', '-ar', '16000', '-b:a', '64k', compressed],
         capture_output=True, timeout=60)
+    kwargs = dict(model='whisper-1', response_format='verbose_json',
+                  timestamp_granularities=['word', 'segment'])
+    if language:
+        kwargs['language'] = language
     with open(compressed, 'rb') as f:
-        result = openai_client.audio.transcriptions.create(
-            model='whisper-1', file=f,
-            response_format='verbose_json',
-            timestamp_granularities=['word', 'segment'])
+        result = openai_client.audio.transcriptions.create(file=f, **kwargs)
     return result
 
 
-def whisper_to_srt(audio_path, output_srt, tmpdir):
-    """音頻 → Whisper → SRT 字幕檔"""
-    result = whisper_transcribe(audio_path, tmpdir)
+def whisper_to_srt(audio_path, output_srt, tmpdir, language='zh'):
+    """音頻 → Whisper → SRT 字幕檔（預設中文）"""
+    result = whisper_transcribe(audio_path, tmpdir, language=language)
     segments = result.segments if hasattr(result, 'segments') else []
     with open(output_srt, 'w', encoding='utf-8') as f:
         for i, seg in enumerate(segments):
@@ -389,7 +393,7 @@ def yt_download_audio(url, tmpdir):
     r = subprocess.run(
         ['yt-dlp', '-x', '--audio-format', 'wav', '--audio-quality', '0',
          '-o', output_path, '--no-playlist', url],
-        capture_output=True, text=True, timeout=120)
+        capture_output=True, text=True, timeout=300)
     if r.returncode != 0:
         raise RuntimeError(f'yt-dlp 失敗: {r.stderr[-300:]}')
     for f in os.listdir(tmpdir):
@@ -461,179 +465,6 @@ def detect_bpm(y, sr):
     if hasattr(tempo, '__len__'):
         tempo = tempo[0]
     return int(round(tempo))
-
-
-def audio_to_midi(audio_path, tmpdir):
-    """用 librosa CQT + onset detection 從乾淨音軌轉 MIDI"""
-    print('  Loading audio for transcription...')
-    y, sr = librosa.load(audio_path, sr=22050, mono=True)
-
-    # 偵測調性和 BPM
-    key_str = detect_key(y, sr)
-    bpm = detect_bpm(y, sr)
-    print(f'  Key: {key_str}, BPM: {bpm}')
-
-    hop = 512
-    # onset detection
-    onset_frames = librosa.onset.onset_detect(y=y, sr=sr, hop_length=hop, backtrack=True)
-    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop)
-    print(f'  偵測到 {len(onset_times)} 個 onset')
-
-    # CQT 頻譜（C1~C8, 84 bins）
-    C = np.abs(librosa.cqt(y, sr=sr, hop_length=hop,
-                            fmin=librosa.note_to_hz('C1'), n_bins=84))
-    times = librosa.times_like(C, sr=sr, hop_length=hop)
-
-    # 動態門檻
-    threshold = np.percentile(C, 92)
-
-    midi_data = pretty_midi.PrettyMIDI(initial_tempo=bpm)
-    piano = pretty_midi.Instrument(program=0, name='Piano')
-
-    for idx in range(len(onset_times)):
-        t_start = onset_times[idx]
-        t_end = onset_times[idx + 1] if idx + 1 < len(onset_times) else times[-1]
-
-        f_start = np.searchsorted(times, t_start)
-        f_end = np.searchsorted(times, t_end)
-        if f_end <= f_start:
-            f_end = f_start + 1
-        if f_start >= C.shape[1]:
-            continue
-
-        segment = C[:, f_start:min(f_end, C.shape[1])]
-        avg_energy = segment.mean(axis=1)
-
-        active_bins = np.where(avg_energy > threshold)[0]
-        if len(active_bins) == 0:
-            continue
-
-        # 最多 6 個同時音
-        if len(active_bins) > 6:
-            top_idx = np.argsort(avg_energy[active_bins])[-6:]
-            active_bins = active_bins[top_idx]
-
-        for b in active_bins:
-            midi_pitch = b + 24  # C1 = MIDI 24
-            midi_pitch = max(21, min(108, midi_pitch))
-            dur = t_end - t_start
-            if dur < 0.03:
-                continue
-            vel = int(min(127, max(30, 40 + avg_energy[b] / threshold * 40)))
-            note = pretty_midi.Note(velocity=vel, pitch=midi_pitch,
-                                     start=t_start, end=t_end)
-            piano.notes.append(note)
-
-    if not piano.notes:
-        raise RuntimeError('無法偵測到音符')
-
-    midi_data.instruments.append(piano)
-    midi_path = os.path.join(tmpdir, 'transcribed.mid')
-    midi_data.write(midi_path)
-    print(f'  MIDI: {len(piano.notes)} 個音符')
-
-    meta = {'key': key_str, 'bpm': bpm}
-    return midi_path, meta
-
-
-def midi_to_lilypond(midi_path, ly_path, title='Piano', key_info=None):
-    """MIDI → LilyPond 樂譜"""
-    midi = pretty_midi.PrettyMIDI(midi_path)
-    all_notes = []
-    for inst in midi.instruments:
-        if not inst.is_drum:
-            all_notes.extend(inst.notes)
-    if not all_notes:
-        raise RuntimeError('MIDI 中沒有音符')
-
-    all_notes.sort(key=lambda n: n.start)
-
-    tempo_times, tempos = midi.get_tempo_changes()
-    bpm = int(tempos[0]) if len(tempos) > 0 else 120
-
-    # 解析調性
-    key_str = (key_info or {}).get('key', 'C major')
-    use_flats = any(x in key_str for x in ['b ', 'flat', 'Bb', 'Eb', 'Ab', 'Db', 'Gb',
-                                             'F major', 'D minor', 'G minor', 'C minor',
-                                             'F minor', 'Bb', 'Eb'])
-
-    SHARP_NAMES = ['c', 'cis', 'd', 'dis', 'e', 'f', 'fis', 'g', 'gis', 'a', 'ais', 'b']
-    FLAT_NAMES = ['c', 'des', 'd', 'ees', 'e', 'f', 'ges', 'g', 'aes', 'a', 'bes', 'b']
-    note_names = FLAT_NAMES if use_flats else SHARP_NAMES
-
-    # LilyPond 調名
-    KEY_MAP = {
-        'C major': 'c \\major', 'G major': 'g \\major', 'D major': 'd \\major',
-        'A major': 'a \\major', 'E major': 'e \\major', 'B major': 'b \\major',
-        'F major': 'f \\major', 'Bb major': 'bes \\major', 'Eb major': 'ees \\major',
-        'Ab major': 'aes \\major', 'Db major': 'des \\major', 'Gb major': 'ges \\major',
-        'F# major': 'fis \\major', 'C# major': 'cis \\major',
-        'A minor': 'a \\minor', 'E minor': 'e \\minor', 'B minor': 'b \\minor',
-        'F# minor': 'fis \\minor', 'C# minor': 'cis \\minor', 'G# minor': 'gis \\minor',
-        'D minor': 'd \\minor', 'G minor': 'g \\minor', 'C minor': 'c \\minor',
-        'F minor': 'f \\minor', 'Bb minor': 'bes \\minor', 'Eb minor': 'ees \\minor',
-    }
-    ly_key = KEY_MAP.get(key_str, 'c \\major')
-
-    # 拍號
-    ts = (key_info or {}).get('time_signature', [4, 4])
-    time_sig = f'{ts[0]}/{ts[1]}' if isinstance(ts, list) and len(ts) == 2 else '4/4'
-
-    def pitch_to_lily(p):
-        octave = (p // 12) - 1
-        name = note_names[p % 12]
-        diff = octave - 3
-        if diff > 0:
-            name += "'" * diff
-        elif diff < 0:
-            name += "," * abs(diff)
-        return name
-
-    def dur_to_lily(dur_sec):
-        beat = 60.0 / bpm
-        beats = dur_sec / beat
-        if beats >= 3.5: return '1'
-        elif beats >= 1.75: return '2'
-        elif beats >= 0.875: return '4'
-        elif beats >= 0.4375: return '8'
-        elif beats >= 0.21875: return '16'
-        else: return '32'
-
-    right = [n for n in all_notes if n.pitch >= 60]
-    left = [n for n in all_notes if n.pitch < 60]
-
-    def to_str(nl):
-        if not nl: return 'r1 r1 r1 r1'
-        return ' '.join(f'{pitch_to_lily(n.pitch)}{dur_to_lily(n.end - n.start)}' for n in nl)
-
-    safe_title = re.sub(r'[\\\"{}]', '', title)
-    ly = f'''\\version "2.24.0"
-\\header {{
-  title = "{safe_title}"
-  subtitle = "AI-transcribed from YouTube — {key_str}"
-  tagline = "Generated by Discord Sheet Music Bot"
-}}
-\\score {{
-  \\new PianoStaff <<
-    \\new Staff = "right" {{
-      \\clef treble
-      \\key {ly_key}
-      \\time {time_sig}
-      \\tempo 4 = {bpm}
-      {{ {to_str(right)} }}
-    }}
-    \\new Staff = "left" {{
-      \\clef bass
-      \\key {ly_key}
-      \\time {time_sig}
-      {{ {to_str(left)} }}
-    }}
-  >>
-  \\layout {{ }}
-}}
-'''
-    with open(ly_path, 'w') as f:
-        f.write(ly)
 
 
 def align_lyrics_to_notes(whisper_result, vocal_notes):
@@ -1001,7 +832,6 @@ async def on_message(message):
                     file=discord.File(video_path, filename=f'{safe_name}.mp4'))
             else:
                 await message.channel.send(f'影片 {fsize/1024/1024:.1f} MB，上傳到 GitHub...')
-                import time
                 ts_name = f'video_{int(time.time())}.mp4'
                 dl_url = await loop.run_in_executor(
                     None, upload_to_github, video_path, ts_name)
@@ -1031,12 +861,28 @@ async def on_message(message):
             pdf_path, midi_path, title = await loop.run_in_executor(
                 None, pdf_pipeline, url, tmpdir, _update_progress)
             safe_name = re.sub(r'[^\w\s\-]', '', title)[:40] or 'score'
-            await message.channel.send(
-                content=f'**{title}** 樂譜：',
-                file=discord.File(pdf_path, filename=f'{safe_name}.pdf'))
-            await message.channel.send(
-                content=f'MIDI：',
-                file=discord.File(midi_path, filename=f'{safe_name}.mid'))
+            # PDF
+            pdf_size = os.path.getsize(pdf_path)
+            if pdf_size <= DISCORD_MAX_BYTES:
+                await message.channel.send(
+                    content=f'**{title}** 樂譜：',
+                    file=discord.File(pdf_path, filename=f'{safe_name}.pdf'))
+            else:
+                ts_name = f'score_{int(time.time())}.pdf'
+                dl_url = await loop.run_in_executor(
+                    None, upload_to_github, pdf_path, ts_name)
+                await message.channel.send(f'**{title}** 樂譜：\n{dl_url}')
+            # MIDI
+            midi_size = os.path.getsize(midi_path)
+            if midi_size <= DISCORD_MAX_BYTES:
+                await message.channel.send(
+                    content=f'MIDI：',
+                    file=discord.File(midi_path, filename=f'{safe_name}.mid'))
+            else:
+                ts_name = f'midi_{int(time.time())}.mid'
+                dl_url = await loop.run_in_executor(
+                    None, upload_to_github, midi_path, ts_name)
+                await message.channel.send(f'MIDI：\n{dl_url}')
         except Exception as e:
             await message.channel.send(f'轉譜失敗：{e}')
         finally:
@@ -1116,7 +962,6 @@ async def on_message(message):
                     file=discord.File(mp3_path, filename=filename))
             else:
                 await message.channel.send(f'檔案 {fsize/1024/1024:.1f} MB，上傳到 GitHub...')
-                import time
                 ts_name = f'mp3_{int(time.time())}.mp3'
                 dl_url = await loop.run_in_executor(
                     None, upload_to_github, mp3_path, ts_name)
