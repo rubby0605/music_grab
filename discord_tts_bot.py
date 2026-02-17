@@ -338,6 +338,62 @@ def pdf_pipeline(url, tmpdir, progress_cb=None):
     return pdf_path, merged_midi, title
 
 
+def jianpu_pipeline(url, tmpdir, progress_cb=None):
+    """YouTube → demucs → pyin + chords + Whisper → 簡譜 PDF"""
+    def update(msg):
+        if progress_cb:
+            progress_cb(msg)
+        print(f'  {msg}')
+
+    update('⬇️ 下載音頻中...')
+    title = yt_get_title(url)
+    wav = yt_download_audio(url, tmpdir)
+
+    update('🎛️ Demucs 分離音軌中...')
+    stems = separate_stems(wav, tmpdir)
+    other_path = stems.get('other')
+    vocals_path = stems.get('vocals')
+    if not vocals_path:
+        raise RuntimeError('demucs 未產出 vocals 軌')
+
+    update('🎤 偵測人聲旋律 (pyin)...')
+    vocals_midi = os.path.join(tmpdir, 'vocals_jianpu.mid')
+    vocals_to_midi_pyin(vocals_path, vocals_midi)
+
+    vm = pretty_midi.PrettyMIDI(vocals_midi)
+    vocal_notes = []
+    for inst in vm.instruments:
+        if not inst.is_drum:
+            vocal_notes.extend(inst.notes)
+    vocal_notes.sort(key=lambda n: n.start)
+
+    # 偵測調性和 BPM
+    ref_audio = other_path or vocals_path
+    y_ref, sr_ref = librosa.load(ref_audio, sr=22050, mono=True)
+    update('🔍 偵測調性和 BPM...')
+    key_str = detect_key(y_ref, sr_ref)
+    bpm_val = detect_bpm(y_ref, sr_ref)
+    print(f'  Key: {key_str}, BPM: {bpm_val}')
+
+    update('🎸 偵測和弦...')
+    chords = detect_chords(ref_audio, bpm_val)
+
+    whisper_result = None
+    update('📝 Whisper 辨識歌詞中...')
+    try:
+        whisper_result = whisper_transcribe(vocals_path, tmpdir)
+    except Exception as e:
+        print(f'  Whisper error: {e}')
+
+    update('🎼 產生簡譜 PDF...')
+    jianpu_bars = format_jianpu(vocal_notes, chords, key_str, bpm_val, whisper_result)
+    pdf_path = os.path.join(tmpdir, 'jianpu.pdf')
+    render_jianpu_pdf(jianpu_bars, title, key_str, bpm_val, pdf_path)
+
+    update('✅ 完成！')
+    return pdf_path, title
+
+
 def whisper_transcribe(audio_path, tmpdir, language=None):
     """用 OpenAI Whisper API 辨識語音，回傳時間戳。language=None 自動偵測"""
     openai_client = OpenAI()
@@ -467,6 +523,292 @@ def detect_bpm(y, sr):
     return int(round(tempo))
 
 
+def _tokenize(text):
+    """CJK 逐字、英文保持整字"""
+    tokens = []
+    word = ''
+    for ch in text:
+        if ('\u4e00' <= ch <= '\u9fff' or '\u3040' <= ch <= '\u30ff'
+                or '\u31f0' <= ch <= '\u31ff' or '\uff00' <= ch <= '\uffef'
+                or '\u3400' <= ch <= '\u4dbf' or '\uac00' <= ch <= '\ud7af'):
+            if word.strip():
+                tokens.append(word.strip())
+                word = ''
+            tokens.append(ch)
+        elif ch in (' ', '\n', '\t'):
+            if word.strip():
+                tokens.append(word.strip())
+                word = ''
+        else:
+            word += ch
+    if word.strip():
+        tokens.append(word.strip())
+    return tokens
+
+
+def detect_chords(audio_path, bpm):
+    """用 chroma 偵測和弦（每小節一個）"""
+    y, sr = librosa.load(audio_path, sr=22050, mono=True)
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+    beat_sec = 60.0 / bpm
+    bar_sec = beat_sec * 4
+    times = librosa.times_like(chroma, sr=sr)
+    if len(times) == 0:
+        return []
+    total_dur = times[-1]
+
+    NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+    major_t = np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0], dtype=float)
+    minor_t = np.array([1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0], dtype=float)
+
+    chords = []
+    t = 0.0
+    while t < total_dur:
+        t_end = min(t + bar_sec, total_dur)
+        mask = (times >= t) & (times < t_end)
+        if mask.sum() == 0:
+            t = t_end
+            continue
+        avg = chroma[:, mask].mean(axis=1)
+        best, name = -1, 'C'
+        for s in range(12):
+            for tmpl, suffix in [(major_t, ''), (minor_t, 'm')]:
+                rolled = np.roll(tmpl, s)
+                denom = np.linalg.norm(avg) * np.linalg.norm(rolled)
+                score = np.dot(avg, rolled) / denom if denom > 0 else 0
+                if score > best:
+                    best, name = score, NAMES[s] + suffix
+        chords.append((t, t_end, name))
+        t = t_end
+
+    print(f'  Detected {len(chords)} chords')
+    return chords
+
+
+def format_jianpu(vocal_notes, chords, key_str, bpm, whisper_result):
+    """人聲音符+和弦+歌詞 → 簡譜格式 (bars list)"""
+    root_name = key_str.split()[0]
+    ROOT_MAP = {'C': 0, 'C#': 1, 'Db': 1, 'D': 2, 'D#': 3, 'Eb': 3,
+                'E': 4, 'F': 5, 'F#': 6, 'Gb': 6, 'G': 7, 'G#': 8,
+                'Ab': 8, 'A': 9, 'A#': 10, 'Bb': 10, 'B': 11}
+    root_pc = ROOT_MAP.get(root_name, 0)
+
+    is_minor = 'minor' in key_str.lower()
+    DEGREE_MAJOR = ['1', '#1', '2', '#2', '3', '4', '#4', '5', '#5', '6', '#6', '7']
+    DEGREE_MINOR = ['1', '#1', '2', 'b3', '3', '4', '#4', '5', 'b6', '6', 'b7', '7']
+    DEGREE = DEGREE_MINOR if is_minor else DEGREE_MAJOR
+
+    # 主音八度（取人聲中位數所在八度）
+    if vocal_notes:
+        med = sorted(n.pitch for n in vocal_notes)[len(vocal_notes) // 2]
+        home_oct = med // 12
+    else:
+        home_oct = 5
+
+    def pitch_to_deg(midi_pitch):
+        sem = (midi_pitch % 12 - root_pc) % 12
+        deg = DEGREE[sem]
+        home_base = home_oct * 12 + root_pc
+        oct_shift = (midi_pitch - home_base) // 12
+        return deg, oct_shift
+
+    beat_sec = 60.0 / bpm
+    eighth = beat_sec / 2
+    bar_sec = beat_sec * 4
+
+    total_dur = max(
+        (max(n.end for n in vocal_notes) if vocal_notes else 0),
+        (max(c[1] for c in chords) if chords else 0),
+        bar_sec)
+    total_bars = int(total_dur / bar_sec) + 1
+    slots_total = total_bars * 8
+
+    # 建立 grid
+    grid = [{'note': '0', 'oct': 0, 'onset': False, 'lyric': ''}
+            for _ in range(slots_total)]
+
+    for note in vocal_notes:
+        s_start = int(round(note.start / eighth))
+        s_end = int(round(note.end / eighth))
+        s_start = max(0, min(s_start, slots_total - 1))
+        s_end = max(s_start + 1, min(s_end, slots_total))
+
+        deg, oct_diff = pitch_to_deg(note.pitch)
+        grid[s_start] = {'note': deg, 'oct': oct_diff, 'onset': True, 'lyric': ''}
+        for s in range(s_start + 1, s_end):
+            if s < slots_total and grid[s]['note'] == '0':
+                grid[s] = {'note': '-', 'oct': 0, 'onset': False, 'lyric': ''}
+
+    # 歌詞對齊
+    if whisper_result:
+        segments = []
+        raw_segs = getattr(whisper_result, 'segments', [])
+        for seg in raw_segs:
+            if isinstance(seg, dict):
+                segments.append((seg['start'], seg['end'], seg['text'].strip()))
+            else:
+                segments.append((seg.start, seg.end, seg.text.strip()))
+
+        timed_tokens = []
+        for seg_s, seg_e, text in segments:
+            tokens = _tokenize(text)
+            if not tokens:
+                continue
+            dt = (seg_e - seg_s) / max(len(tokens), 1)
+            for i, tok in enumerate(tokens):
+                timed_tokens.append((seg_s + i * dt, tok))
+
+        ci = 0
+        for s in range(slots_total):
+            if not grid[s]['onset']:
+                continue
+            t = s * eighth
+            while ci < len(timed_tokens) and timed_tokens[ci][0] < t - 0.8:
+                ci += 1
+            if ci < len(timed_tokens) and abs(timed_tokens[ci][0] - t) < 1.5:
+                grid[s]['lyric'] = timed_tokens[ci][1]
+                ci += 1
+
+    # 和弦對齊到小節
+    bar_chords = [''] * total_bars
+    for start, end, name in chords:
+        idx = int(start / bar_sec)
+        if 0 <= idx < total_bars:
+            bar_chords[idx] = name
+
+    # 組裝 bars
+    bars = []
+    for b in range(total_bars):
+        slots = grid[b * 8: b * 8 + 8]
+        bars.append({'chord': bar_chords[b], 'slots': slots})
+
+    return bars
+
+
+def render_jianpu_pdf(bars, title, key_str, bpm, output_pdf):
+    """簡譜資料 → PDF（matplotlib）"""
+    import matplotlib
+    matplotlib.use('Agg')
+    matplotlib.rcParams['font.sans-serif'] = [
+        'PingFang TC', 'Hiragino Sans', 'Arial Unicode MS',
+        'Noto Sans CJK TC', 'SimHei', 'sans-serif']
+    matplotlib.rcParams['axes.unicode_minus'] = False
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    root_name = key_str.split()[0]
+    BARS_PER_LINE = 2
+
+    # A4 page (inches)
+    pw, ph = 8.27, 11.69
+    ml, mr, mt, mb = 0.8, 0.6, 0.5, 0.5
+    usable_w = pw - ml - mr
+
+    bar_w = usable_w / BARS_PER_LINE
+    slot_w = bar_w / 8
+
+    chord_h = 0.22
+    note_h = 0.30
+    lyric_h = 0.25
+    group_gap = 0.18
+    group_h = chord_h + note_h + lyric_h + group_gap
+
+    title_block_h = 0.9
+    lines_p1 = int((ph - mt - mb - title_block_h) / group_h)
+    lines_pn = int((ph - mt - mb) / group_h)
+
+    # 去掉尾部空白小節
+    while len(bars) > 1 and all(s['note'] == '0' for s in bars[-1]['slots']):
+        bars.pop()
+    total_lines = (len(bars) + BARS_PER_LINE - 1) // BARS_PER_LINE
+
+    with PdfPages(output_pdf) as pdf:
+        li = 0
+        pg = 0
+        while li < total_lines:
+            fig = plt.figure(figsize=(pw, ph))
+            ax = fig.add_axes([0, 0, 1, 1])
+            ax.set_xlim(0, pw)
+            ax.set_ylim(0, ph)
+            ax.axis('off')
+
+            if pg == 0:
+                y = ph - mt - 0.15
+                ax.text(pw / 2, y, title, ha='center', va='top',
+                        fontsize=18, fontweight='bold')
+                y -= 0.4
+                ax.text(pw / 2, y, f'1={root_name}    {bpm} BPM    4/4',
+                        ha='center', va='top', fontsize=12, color='#555')
+                y -= 0.45
+                max_lines = lines_p1
+            else:
+                y = ph - mt
+                max_lines = lines_pn
+
+            for _ in range(max_lines):
+                if li >= total_lines:
+                    break
+
+                bs = li * BARS_PER_LINE
+                be = min(bs + BARS_PER_LINE, len(bars))
+                n_bars = be - bs
+
+                yc = y
+                yn = y - chord_h
+                yl = y - chord_h - note_h
+
+                # 小節線
+                for i in range(n_bars + 1):
+                    x = ml + i * bar_w
+                    lw = 1.5 if (bs + i == len(bars)) else 0.8
+                    ax.plot([x, x], [yc + 0.1, yl - 0.1], 'k-', lw=lw)
+
+                for bi in range(bs, be):
+                    bar = bars[bi]
+                    bx = ml + (bi - bs) * bar_w
+
+                    if bar['chord']:
+                        ax.text(bx + 0.08, yc, bar['chord'],
+                                ha='left', va='top', fontsize=10,
+                                fontweight='bold', style='italic', color='#333')
+
+                    for si, slot in enumerate(bar['slots']):
+                        sx = bx + si * slot_w + slot_w / 2
+                        note = slot['note']
+                        if note not in ('0', '-'):
+                            ax.text(sx, yn, note, ha='center', va='top',
+                                    fontsize=14, fontweight='bold')
+                            oc = slot['oct']
+                            if oc > 0:
+                                for d in range(oc):
+                                    ax.plot(sx, yn + 0.08 + d * 0.07,
+                                            'ko', markersize=3)
+                            elif oc < 0:
+                                for d in range(-oc):
+                                    ax.plot(sx, yn - 0.25 - d * 0.07,
+                                            'ko', markersize=3)
+                        elif note == '-':
+                            ax.text(sx, yn, '-', ha='center', va='top',
+                                    fontsize=14, color='#666')
+                        else:
+                            ax.text(sx, yn, '0', ha='center', va='top',
+                                    fontsize=14, color='#ccc')
+
+                        if slot.get('lyric'):
+                            ax.text(sx, yl, slot['lyric'],
+                                    ha='center', va='top', fontsize=10)
+
+                y -= group_h
+                li += 1
+
+            pdf.savefig(fig)
+            plt.close(fig)
+            pg += 1
+
+    print(f'  Jianpu PDF: {total_lines} lines, {pg} pages')
+    return output_pdf
+
+
 def align_lyrics_to_notes(whisper_result, vocal_notes):
     """用 Whisper 時間戳把歌詞對齊到人聲音符（兩指針掃描）"""
     if not whisper_result or not vocal_notes:
@@ -482,28 +824,6 @@ def align_lyrics_to_notes(whisper_result, vocal_notes):
 
     if not segments:
         return []
-
-    # 把每個 segment 拆成 token（CJK 逐字、英文保持整字）
-    def _tokenize(text):
-        tokens = []
-        word = ''
-        for ch in text:
-            if ('\u4e00' <= ch <= '\u9fff' or '\u3040' <= ch <= '\u30ff'
-                    or '\u31f0' <= ch <= '\u31ff' or '\uff00' <= ch <= '\uffef'
-                    or '\u3400' <= ch <= '\u4dbf' or '\uac00' <= ch <= '\ud7af'):
-                if word.strip():
-                    tokens.append(word.strip())
-                    word = ''
-                tokens.append(ch)
-            elif ch in (' ', '\n', '\t'):
-                if word.strip():
-                    tokens.append(word.strip())
-                    word = ''
-            else:
-                word += ch
-        if word.strip():
-            tokens.append(word.strip())
-        return tokens
 
     timed_chars = []
     for seg_start, seg_end, text in segments:
@@ -794,6 +1114,7 @@ async def on_message(message):
 `!dep <URL>` → Demucs 分離四軌（人聲/鼓/貝斯/其他）
 `!midi <URL>` → 轉 MIDI（人聲+伴奏）
 `!pdf <URL>` → 轉樂譜 PDF（含歌詞）
+`!jianpu <URL>` → 轉簡譜 PDF（數字譜+和弦+歌詞）
 
 📝 **字幕**
 上傳 MP4/MKV/AVI → Whisper 自動辨識 → SRT 字幕檔
@@ -810,6 +1131,7 @@ async def on_message(message):
     is_dep_cmd = content.lower().startswith('!dep')
     is_pdf_cmd = content.lower().startswith('!pdf')
     is_midi_cmd = content.lower().startswith('!midi')
+    is_jianpu_cmd = content.lower().startswith('!jianpu')
     yt_match = YT_URL_PATTERN.search(content)
 
     if is_video_cmd and yt_match:
@@ -885,6 +1207,41 @@ async def on_message(message):
                 await message.channel.send(f'MIDI：\n{dl_url}')
         except Exception as e:
             await message.channel.send(f'轉譜失敗：{e}')
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+
+    if is_jianpu_cmd and yt_match:
+        url = yt_match.group(0)
+        if not url.startswith('http'):
+            url = 'https://' + url
+
+        progress_msg = await message.channel.send('🎵 開始轉簡譜...')
+        tmpdir = tempfile.mkdtemp()
+        try:
+            progress_state = {'msg': progress_msg, 'loop': loop}
+
+            def _update_jianpu(text):
+                asyncio.run_coroutine_threadsafe(
+                    progress_state['msg'].edit(content=text),
+                    progress_state['loop'])
+
+            pdf_path, title = await loop.run_in_executor(
+                None, jianpu_pipeline, url, tmpdir, _update_jianpu)
+            safe_name = re.sub(r'[^\w\s\-]', '', title)[:40] or 'jianpu'
+
+            pdf_size = os.path.getsize(pdf_path)
+            if pdf_size <= DISCORD_MAX_BYTES:
+                await message.channel.send(
+                    content=f'**{title}** 簡譜：',
+                    file=discord.File(pdf_path, filename=f'{safe_name}_jianpu.pdf'))
+            else:
+                ts_name = f'jianpu_{int(time.time())}.pdf'
+                dl_url = await loop.run_in_executor(
+                    None, upload_to_github, pdf_path, ts_name)
+                await message.channel.send(f'**{title}** 簡譜：\n{dl_url}')
+        except Exception as e:
+            await message.channel.send(f'簡譜轉譜失敗：{e}')
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
         return
