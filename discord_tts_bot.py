@@ -23,6 +23,7 @@ from piano_transcription_inference import PianoTranscription, sample_rate as PT_
 
 DISCORD_TOKEN = os.environ.get('DISCORD_BOT_TOKEN', '')
 SUPPORTED_EXT = ('.pdf', '.docx')
+VIDEO_EXT = ('.mp4', '.mkv', '.avi', '.mov', '.webm')
 DISCORD_MAX_BYTES = 8 * 1024 * 1024  # 未加成伺服器上限 8MB
 YT_URL_PATTERN = re.compile(
     r'(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)[\w\-]+'
@@ -176,6 +177,59 @@ def transcribe_to_midi(audio_path, output_midi):
     return output_midi
 
 
+def vocals_to_midi_pyin(audio_path, output_midi):
+    """用 librosa pyin 將單音人聲轉成 MIDI（比 Piano Transcription 準確）"""
+    y, sr = librosa.load(audio_path, sr=22050, mono=True)
+    f0, voiced_flag, voiced_probs = librosa.pyin(
+        y, fmin=librosa.note_to_hz('C2'),
+        fmax=librosa.note_to_hz('C6'), sr=sr)
+    times = librosa.times_like(f0, sr=sr)
+
+    midi_data = pretty_midi.PrettyMIDI()
+    voice = pretty_midi.Instrument(program=0, name='Vocals')
+
+    in_note = False
+    note_start = 0.0
+    note_pitch = 0
+
+    for i in range(len(f0)):
+        if voiced_flag[i] and f0[i] is not None and not np.isnan(f0[i]):
+            midi_pitch = int(round(librosa.hz_to_midi(f0[i])))
+            midi_pitch = max(21, min(108, midi_pitch))
+            if not in_note:
+                in_note = True
+                note_start = times[i]
+                note_pitch = midi_pitch
+            elif abs(midi_pitch - note_pitch) > 1:
+                dur = times[i] - note_start
+                if dur > 0.05:
+                    voice.notes.append(pretty_midi.Note(
+                        velocity=80, pitch=note_pitch,
+                        start=note_start, end=times[i]))
+                note_start = times[i]
+                note_pitch = midi_pitch
+        else:
+            if in_note:
+                dur = times[i] - note_start
+                if dur > 0.05:
+                    voice.notes.append(pretty_midi.Note(
+                        velocity=80, pitch=note_pitch,
+                        start=note_start, end=times[i]))
+                in_note = False
+
+    if in_note and len(times) > 0:
+        dur = times[-1] - note_start
+        if dur > 0.05:
+            voice.notes.append(pretty_midi.Note(
+                velocity=80, pitch=note_pitch,
+                start=note_start, end=times[-1]))
+
+    midi_data.instruments.append(voice)
+    midi_data.write(output_midi)
+    print(f'  pyin: {len(voice.notes)} vocal notes')
+    return output_midi
+
+
 def midi_pipeline(url, tmpdir):
     """YouTube → demucs → Piano Transcription → MIDI (vocals + other)"""
     title = yt_get_title(url)
@@ -197,12 +251,12 @@ def midi_pipeline(url, tmpdir):
     other_midi = os.path.join(tmpdir, 'other.mid')
     transcribe_to_midi(other_path, other_midi)
 
-    # 4. Transcribe vocals
+    # 4. Transcribe vocals (pyin for monophonic)
     vocals_midi = None
     if vocals_path:
-        print('  Transcribing vocals...')
+        print('  Transcribing vocals (pyin)...')
         vocals_midi = os.path.join(tmpdir, 'vocals.mid')
-        transcribe_to_midi(vocals_path, vocals_midi)
+        vocals_to_midi_pyin(vocals_path, vocals_midi)
 
     return other_midi, vocals_midi, title
 
@@ -228,24 +282,106 @@ def merge_midi(other_midi, vocals_midi, output_path):
     return output_path
 
 
-def pdf_pipeline(url, tmpdir):
-    """YouTube → demucs → Piano Transcription → MIDI → LilyPond → PDF"""
-    other_midi, vocals_midi, title = midi_pipeline(url, tmpdir)
+def pdf_pipeline(url, tmpdir, progress_cb=None):
+    """YouTube → demucs → Piano Transcription → Whisper → LilyPond → PDF"""
+    def update(msg):
+        if progress_cb:
+            progress_cb(msg)
+        print(f'  {msg}')
+
+    update('⬇️ 下載音頻中...')
+    title = yt_get_title(url)
+    wav = yt_download_audio(url, tmpdir)
+
+    update('🎛️ Demucs 分離音軌中...')
+    stems = separate_stems(wav, tmpdir)
+
+    other_path = stems.get('other')
+    vocals_path = stems.get('vocals')
+
+    update('🎹 轉譜：伴奏軌...')
+    other_midi = os.path.join(tmpdir, 'other.mid')
+    transcribe_to_midi(other_path, other_midi)
+
+    vocals_midi = None
+    if vocals_path:
+        update('🎤 轉譜：人聲軌 (pyin)...')
+        vocals_midi = os.path.join(tmpdir, 'vocals.mid')
+        vocals_to_midi_pyin(vocals_path, vocals_midi)
+
+    # Whisper 辨識歌詞
+    whisper_result = None
+    if vocals_path:
+        update('📝 Whisper 辨識歌詞中...')
+        try:
+            whisper_result = whisper_transcribe(vocals_path, tmpdir)
+            lyrics_text = whisper_result.text if hasattr(whisper_result, 'text') else ''
+            print(f'  Lyrics: {lyrics_text[:80]}...')
+        except Exception as e:
+            print(f'  Whisper error: {e}')
 
     # 合併 MIDI
     merged_midi = os.path.join(tmpdir, 'merged.mid')
     merge_midi(other_midi, vocals_midi, merged_midi)
 
-    # MIDI → LilyPond（含人聲譜）
+    update('📄 產生樂譜 PDF...')
     ly_path = os.path.join(tmpdir, 'score.ly')
-    print('  Converting MIDI to LilyPond...')
-    midi_to_lilypond_full(other_midi, vocals_midi, ly_path, title=title)
-    print('  LilyPond file created, compiling PDF...')
+    midi_to_lilypond_full(other_midi, vocals_midi, ly_path, title=title,
+                          whisper_result=whisper_result, audio_path=other_path)
 
-    # LilyPond → PDF
     pdf_path = lilypond_to_pdf(ly_path, tmpdir)
-    print(f'  PDF done: {pdf_path}')
+    update('✅ 完成！')
     return pdf_path, merged_midi, title
+
+
+def whisper_transcribe(audio_path, tmpdir):
+    """用 OpenAI Whisper API 辨識歌詞，回傳 word-level 時間戳"""
+    openai_client = OpenAI()
+    # 壓縮成小 mp3 給 API
+    compressed = os.path.join(tmpdir, 'whisper_input.mp3')
+    subprocess.run(
+        ['ffmpeg', '-y', '-i', audio_path, '-ac', '1', '-ar', '16000', '-b:a', '64k', compressed],
+        capture_output=True, timeout=60)
+    with open(compressed, 'rb') as f:
+        result = openai_client.audio.transcriptions.create(
+            model='whisper-1', file=f,
+            response_format='verbose_json',
+            timestamp_granularities=['word', 'segment'])
+    return result
+
+
+def whisper_to_srt(audio_path, output_srt, tmpdir):
+    """音頻 → Whisper → SRT 字幕檔"""
+    result = whisper_transcribe(audio_path, tmpdir)
+    segments = result.segments if hasattr(result, 'segments') else []
+    with open(output_srt, 'w', encoding='utf-8') as f:
+        for i, seg in enumerate(segments):
+            start = seg['start'] if isinstance(seg, dict) else seg.start
+            end = seg['end'] if isinstance(seg, dict) else seg.end
+            text = seg['text'] if isinstance(seg, dict) else seg.text
+            f.write(f"{i+1}\n")
+            f.write(f"{_srt_time(start)} --> {_srt_time(end)}\n")
+            f.write(f"{text.strip()}\n\n")
+    return output_srt
+
+
+def _srt_time(seconds):
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def video_add_subtitles(video_path, srt_path, output_path):
+    """把 SRT 字幕燒進影片"""
+    r = subprocess.run(
+        ['ffmpeg', '-y', '-i', video_path, '-vf', f"subtitles={srt_path}",
+         '-c:a', 'copy', output_path],
+        capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(f'ffmpeg 字幕合成失敗: {r.stderr[-200:]}')
+    return output_path
 
 
 def yt_download_audio(url, tmpdir):
@@ -500,8 +636,57 @@ def midi_to_lilypond(midi_path, ly_path, title='Piano', key_info=None):
         f.write(ly)
 
 
-def midi_to_lilypond_full(other_midi, vocals_midi, ly_path, title='Score'):
-    """MIDI → LilyPond 總譜（人聲 + 鋼琴左右手）"""
+def align_lyrics_to_notes(whisper_result, vocal_notes):
+    """用 Whisper 時間戳把歌詞對齊到人聲音符（兩指針掃描）"""
+    if not whisper_result or not vocal_notes:
+        return []
+
+    segments = []
+    raw_segments = getattr(whisper_result, 'segments', [])
+    for seg in raw_segments:
+        if isinstance(seg, dict):
+            segments.append((seg['start'], seg['end'], seg['text'].strip()))
+        else:
+            segments.append((seg.start, seg.end, seg.text.strip()))
+
+    if not segments:
+        return []
+
+    # 把每個 segment 的文字拆成帶時間戳的字元
+    timed_chars = []
+    for seg_start, seg_end, text in segments:
+        chars = [ch for ch in text if ch.strip()]
+        if not chars:
+            continue
+        char_dur = (seg_end - seg_start) / max(len(chars), 1)
+        for i, ch in enumerate(chars):
+            timed_chars.append((seg_start + i * char_dur, ch))
+
+    if not timed_chars:
+        return []
+
+    # 兩指針對齊：每個音符找最近的未使用字元
+    result = []
+    ci = 0
+    for note in vocal_notes:
+        # 跳過時間上太早的字元
+        while ci < len(timed_chars) and timed_chars[ci][0] < note.start - 0.8:
+            ci += 1
+
+        if ci < len(timed_chars) and abs(timed_chars[ci][0] - note.start) < 1.5:
+            ch = timed_chars[ci][1]
+            safe_ch = ch.replace('"', '').replace('\\', '').replace('{', '').replace('}', '')
+            result.append(f'"{safe_ch}"' if safe_ch else '_')
+            ci += 1
+        else:
+            result.append('_')
+
+    return result
+
+
+def midi_to_lilypond_full(other_midi, vocals_midi, ly_path, title='Score',
+                          whisper_result=None, audio_path=None):
+    """MIDI → LilyPond 總譜（人聲+歌詞 + 鋼琴左右手，含和弦+休止符+調性）"""
 
     def get_notes(midi_path):
         midi = pretty_midi.PrettyMIDI(midi_path)
@@ -509,20 +694,49 @@ def midi_to_lilypond_full(other_midi, vocals_midi, ly_path, title='Score'):
         for inst in midi.instruments:
             if not inst.is_drum:
                 notes.extend(inst.notes)
-        notes.sort(key=lambda n: n.start)
+        notes.sort(key=lambda n: (n.start, n.pitch))
         return notes, midi
 
     other_notes, other_pm = get_notes(other_midi)
 
-    # BPM
     tempo_times, tempos = other_pm.get_tempo_changes()
     bpm = int(tempos[0]) if len(tempos) > 0 else 120
+    beat_sec = 60.0 / bpm
+
+    # 調性偵測
+    key_str = 'C major'
+    if audio_path:
+        try:
+            y_key, sr_key = librosa.load(audio_path, sr=22050, mono=True)
+            key_str = detect_key(y_key, sr_key)
+            print(f'  Detected key: {key_str}')
+        except Exception as e:
+            print(f'  Key detection failed: {e}')
+
+    FLAT_KEYS = {'F major', 'Bb major', 'Eb major', 'Ab major', 'Db major', 'Gb major',
+                 'D minor', 'G minor', 'C minor', 'F minor', 'Bb minor', 'Eb minor'}
+    use_flats = key_str in FLAT_KEYS
 
     SHARP_NAMES = ['c', 'cis', 'd', 'dis', 'e', 'f', 'fis', 'g', 'gis', 'a', 'ais', 'b']
+    FLAT_NAMES = ['c', 'des', 'd', 'ees', 'e', 'f', 'ges', 'g', 'aes', 'a', 'bes', 'b']
+    note_names = FLAT_NAMES if use_flats else SHARP_NAMES
+
+    KEY_MAP = {
+        'C major': 'c \\major', 'G major': 'g \\major', 'D major': 'd \\major',
+        'A major': 'a \\major', 'E major': 'e \\major', 'B major': 'b \\major',
+        'F major': 'f \\major', 'Bb major': 'bes \\major', 'Eb major': 'ees \\major',
+        'Ab major': 'aes \\major', 'Db major': 'des \\major', 'Gb major': 'ges \\major',
+        'F# major': 'fis \\major', 'C# major': 'cis \\major',
+        'A minor': 'a \\minor', 'E minor': 'e \\minor', 'B minor': 'b \\minor',
+        'F# minor': 'fis \\minor', 'C# minor': 'cis \\minor', 'G# minor': 'gis \\minor',
+        'D minor': 'd \\minor', 'G minor': 'g \\minor', 'C minor': 'c \\minor',
+        'F minor': 'f \\minor', 'Bb minor': 'bes \\minor', 'Eb minor': 'ees \\minor',
+    }
+    ly_key = KEY_MAP.get(key_str, 'c \\major')
 
     def pitch_to_lily(p):
         octave = (p // 12) - 1
-        name = SHARP_NAMES[p % 12]
+        name = note_names[p % 12]
         diff = octave - 3
         if diff > 0:
             name += "'" * diff
@@ -530,63 +744,148 @@ def midi_to_lilypond_full(other_midi, vocals_midi, ly_path, title='Score'):
             name += "," * abs(diff)
         return name
 
-    def dur_to_lily(dur_sec):
-        beat = 60.0 / bpm
-        beats = dur_sec / beat
+    def beats_to_lily_dur(beats):
         if beats >= 3.5: return '1'
         elif beats >= 1.75: return '2'
+        elif beats >= 1.2: return '4.'
         elif beats >= 0.875: return '4'
+        elif beats >= 0.625: return '8.'
         elif beats >= 0.4375: return '8'
         elif beats >= 0.21875: return '16'
         else: return '32'
 
-    def to_str(nl):
-        if not nl:
-            return 'r1 r1 r1 r1'
-        return ' '.join(f'{pitch_to_lily(n.pitch)}{dur_to_lily(n.end - n.start)}' for n in nl)
+    def fill_rests(beats):
+        if beats <= 0.1:
+            return ''
+        parts = []
+        remaining = beats
+        for val, name in [(4.0, 'r1'), (2.0, 'r2'), (1.0, 'r4'), (0.5, 'r8'), (0.25, 'r16')]:
+            while remaining >= val - 0.05:
+                parts.append(name)
+                remaining -= val
+        return ' '.join(parts)
 
-    # Piano: split by middle C
+    def notes_to_str(note_list):
+        """音符列表 → LilyPond 字串（含和弦分組+休止符+小節線）"""
+        if not note_list:
+            return 'R1*4'
+
+        # 按起始時間分組（同時間的音組成和弦）
+        CHORD_TOL = 0.05  # 秒
+        sorted_notes = sorted(note_list, key=lambda n: (n.start, n.pitch))
+        groups = []
+        i = 0
+        while i < len(sorted_notes):
+            group = [sorted_notes[i]]
+            j = i + 1
+            while j < len(sorted_notes) and abs(sorted_notes[j].start - sorted_notes[i].start) < CHORD_TOL:
+                group.append(sorted_notes[j])
+                j += 1
+            groups.append(group)
+            i = j
+
+        bar_dur = 4 * beat_sec  # 一小節的秒數
+        next_bar = bar_dur      # 下一個小節線的時間
+        parts = ['\\cadenzaOn']
+        cursor = 0.0
+
+        for group in groups:
+            gap = group[0].start - cursor
+            if gap > beat_sec * 0.2:
+                gap_beats = gap / beat_sec
+                rest = fill_rests(gap_beats)
+                if rest:
+                    parts.append(rest)
+
+            min_dur = min(n.end - n.start for n in group)
+            dur_beats = min_dur / beat_sec
+            dur_str = beats_to_lily_dur(dur_beats)
+
+            if len(group) == 1:
+                parts.append(f'{pitch_to_lily(group[0].pitch)}{dur_str}')
+            else:
+                pitches = ' '.join(pitch_to_lily(n.pitch)
+                                   for n in sorted(group, key=lambda n: n.pitch))
+                parts.append(f'<{pitches}>{dur_str}')
+
+            cursor = max(n.end for n in group)
+
+            # 每隔一小節插入小節線（讓 LilyPond 換行）
+            while cursor >= next_bar - 0.05:
+                parts.append('\\bar "|"')
+                next_bar += bar_dur
+
+        parts.append('\\bar "|."')
+        return ' '.join(parts)
+
+    # 用中央 C (MIDI 60) 分左右手
     right = [n for n in other_notes if n.pitch >= 60]
     left = [n for n in other_notes if n.pitch < 60]
 
     # Vocals
-    vocal_str = 'r1 r1 r1 r1'
+    vocal_notes = []
     if vocals_midi:
         vocal_notes, _ = get_notes(vocals_midi)
-        if vocal_notes:
-            vocal_str = to_str(vocal_notes)
+
+    # 歌詞（用 Whisper 時間戳對齊）
+    lyrics_block = ''
+    if whisper_result and vocal_notes:
+        ly_words = align_lyrics_to_notes(whisper_result, vocal_notes)
+        # 去掉尾部連續的 _
+        while ly_words and ly_words[-1] == '_':
+            ly_words.pop()
+        if ly_words:
+            lyrics_block = '\\new Lyrics \\lyricsto "vox" { ' + ' '.join(ly_words) + ' }'
 
     safe_title = re.sub(r'[\\\"{}]', '', title)
     ly = f'''\\version "2.24.0"
 \\header {{
   title = "{safe_title}"
-  subtitle = "AI-transcribed from YouTube"
+  subtitle = "AI-transcribed from YouTube — {key_str}"
   tagline = "Generated by Music Grab Bot"
+}}
+\\paper {{
+  #(set-paper-size "a4")
+  top-margin = 10
+  bottom-margin = 10
+  left-margin = 12
+  right-margin = 12
 }}
 \\score {{
   <<
     \\new Staff = "vocals" \\with {{ instrumentName = "Vocals" }} {{
       \\clef treble
+      \\key {ly_key}
+      \\time 4/4
       \\tempo 4 = {bpm}
-      {{ {vocal_str} }}
+      \\new Voice = "vox" {{ {notes_to_str(vocal_notes)} }}
     }}
+    {lyrics_block}
     \\new PianoStaff \\with {{ instrumentName = "Piano" }} <<
       \\new Staff = "right" {{
         \\clef treble
-        {{ {to_str(right)} }}
+        \\key {ly_key}
+        \\time 4/4
+        {{ {notes_to_str(right)} }}
       }}
       \\new Staff = "left" {{
         \\clef bass
-        {{ {to_str(left)} }}
+        \\key {ly_key}
+        \\time 4/4
+        {{ {notes_to_str(left)} }}
       }}
     >>
   >>
-  \\layout {{ }}
+  \\layout {{
+    indent = 15\\mm
+    short-indent = 5\\mm
+  }}
 }}
 '''
     with open(ly_path, 'w') as f:
         f.write(ly)
-    print(f'  LilyPond: vocals={len(vocal_str.split())}, right={len(right)}, left={len(left)} notes')
+    n_lyrics = len(getattr(whisper_result, 'text', '')) if whisper_result else 0
+    print(f'  LilyPond: vocals={len(vocal_notes)}, RH={len(right)}, LH={len(left)}, lyrics={n_lyrics} chars')
 
 
 def lilypond_to_pdf(ly_path, tmpdir):
@@ -642,7 +941,10 @@ async def on_message(message):
 🎼 **音樂處理**
 `!dep <URL>` → Demucs 分離四軌（人聲/鼓/貝斯/其他）
 `!midi <URL>` → 轉 MIDI（人聲+伴奏）
-`!pdf <URL>` → 轉樂譜 PDF
+`!pdf <URL>` → 轉樂譜 PDF（含歌詞）
+
+📝 **字幕**
+上傳 MP4/MKV/AVI → Whisper 自動辨識 → SRT 字幕檔
 
 🔊 **文件轉語音**
 上傳 PDF 或 DOCX → AI 摘要 → MP3 語音
@@ -694,11 +996,19 @@ async def on_message(message):
         if not url.startswith('http'):
             url = 'https://' + url
 
-        await message.channel.send('開始轉樂譜（下載 → 分離音軌 → 轉譜 → PDF），需要幾分鐘...')
+        progress_msg = await message.channel.send('🎵 開始轉樂譜...')
         tmpdir = tempfile.mkdtemp()
         try:
+            # 用 progress callback 更新 Discord 訊息
+            progress_state = {'msg': progress_msg, 'loop': loop}
+
+            def _update_progress(text):
+                asyncio.run_coroutine_threadsafe(
+                    progress_state['msg'].edit(content=text),
+                    progress_state['loop'])
+
             pdf_path, midi_path, title = await loop.run_in_executor(
-                None, pdf_pipeline, url, tmpdir)
+                None, pdf_pipeline, url, tmpdir, _update_progress)
             safe_name = re.sub(r'[^\w\s\-]', '', title)[:40] or 'score'
             await message.channel.send(
                 content=f'**{title}** 樂譜：',
@@ -792,6 +1102,40 @@ async def on_message(message):
                 await message.channel.send(f'**{title}**\n{dl_url}')
         except Exception as e:
             await message.channel.send(f'下載失敗：{e}')
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        return
+
+    # ── 上傳 MP4 → Whisper 字幕 ──
+    for attachment in message.attachments:
+        ext = os.path.splitext(attachment.filename)[1].lower()
+        if ext not in VIDEO_EXT:
+            continue
+
+        progress_msg = await message.channel.send(f'收到 `{attachment.filename}`，Whisper 字幕產生中...')
+        tmpdir = tempfile.mkdtemp()
+        video_path = os.path.join(tmpdir, attachment.filename)
+        await attachment.save(video_path)
+
+        try:
+            # 提取音頻
+            audio_path = os.path.join(tmpdir, 'audio.wav')
+            await loop.run_in_executor(None, lambda: subprocess.run(
+                ['ffmpeg', '-y', '-i', video_path, '-vn', '-ac', '1', '-ar', '16000', audio_path],
+                capture_output=True, timeout=120))
+
+            # Whisper
+            srt_path = os.path.join(tmpdir, 'subtitles.srt')
+            await loop.run_in_executor(None, whisper_to_srt, audio_path, srt_path, tmpdir)
+
+            base_name = os.path.splitext(attachment.filename)[0]
+            await message.channel.send(
+                content=f'`{attachment.filename}` 字幕：',
+                file=discord.File(srt_path, filename=f'{base_name}.srt'))
+
+            await progress_msg.edit(content='✅ 字幕產生完成！')
+        except Exception as e:
+            await message.channel.send(f'字幕失敗：{e}')
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
         return
